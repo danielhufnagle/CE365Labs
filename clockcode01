@@ -1,0 +1,266 @@
+/*
+  XIAO ESP32S3 Sense — Simple Watch-Style Clock on SSD1306 OLED (I2C)
+  -------------------------------------------------------------------
+  - Renders a live clock and a time-setting UI using the ESP32-S3 touch pins.
+  - Starts at 2025-01-01 12:00:00.
+  - Time-Set Mode: freeze ticking, blink colons, underline the active field.
+  - Touch controls (NO DEBOUNCING BY REQUEST):
+      Touch1 (GPIO1): Toggle Time-Set Mode on/off
+      Touch2 (GPIO2): Move selection (Year→Month→Day→Hour→Minute→Second→wrap)
+      Touch3 (GPIO3): Increment the selected field with rollover rules
+  - OLED: SSD1306 128x64 at I2C address 0x3C (very common).
+  - I2C pins: use the XIAO board's SDA/SCL pads (Wire.begin() no pin args).
+
+  Notes:
+  * If your panel uses 0x3D instead of 0x3C, change OLED_ADDR below.
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ======================= OLED configuration =======================
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1           // Not used with I2C
+#define OLED_ADDR     0x3C         // Typical address for SSD1306 modules
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ======================= Touch pin mapping (XIAO ESP32S3) =========
+// Silk labels "Touch1/2/3" map to GPIO1/2/3 on this board.
+#define TOUCH_TOGGLE  1   // Touch1 -> toggle Time-Set Mode
+#define TOUCH_SELECT  2   // Touch2 -> cycle selected field
+#define TOUCH_INC     3   // Touch3 -> increment selected field
+
+// ======================= Touch calibration and thresholds =========
+// We sample each touch pin at boot to estimate a baseline (no finger).
+// On ESP32 touchRead: LOWER values mean "more touched".
+uint16_t baseToggle = 0, baseSelect = 0, baseInc = 0;
+uint16_t thrToggle  = 0, thrSelect  = 0, thrInc   = 0;
+
+// Offset subtracted from baseline to produce a trigger threshold.
+// Increase if you get false triggers; decrease if touches don’t register.
+const uint16_t TOUCH_OFFSET = 200;
+
+// ======================= Time state and UI state ==================
+struct DateTime {
+  int year;
+  int month;
+  int day;
+  int hour;
+  int minute;
+  int second;
+};
+
+// Initialize to the required boot time:
+DateTime nowTime = {2025, 1, 1, 12, 0, 0};
+
+// Soft clock: we tick once per second using millis().
+uint32_t lastTickMs = 0;
+
+// UI mode and selection index:
+// selIndex: 0=Year, 1=Month, 2=Day, 3=Hour, 4=Minute, 5=Second
+bool timeSetMode = false;
+uint8_t selIndex = 0;
+
+// ======================= Date/Time helpers ========================
+bool isLeap(int y) {
+  return ( (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0) );
+}
+
+int daysInMonth(int y, int m) {
+  static const int d[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (m == 2) return d[1] + (isLeap(y) ? 1 : 0);
+  return d[m-1];
+}
+
+// Ensure fields stay in valid ranges (wrap-around for h/m/s/day/month)
+void clampDate(DateTime &dt) {
+  if (dt.month < 1)  dt.month = 12;
+  if (dt.month > 12) dt.month = 1;
+
+  int dim = daysInMonth(dt.year, dt.month);
+  if (dt.day < 1)    dt.day = dim;
+  if (dt.day > dim)  dt.day = 1;
+
+  if (dt.hour   < 0) dt.hour   = 23;
+  if (dt.hour   > 23)dt.hour   = 0;
+  if (dt.minute < 0) dt.minute = 59;
+  if (dt.minute > 59)dt.minute = 0;
+  if (dt.second < 0) dt.second = 59;
+  if (dt.second > 59)dt.second = 0;
+}
+
+// Increment exactly one field with rollover semantics
+void incrementField(uint8_t idx) {
+  switch (idx) {
+    case 0: nowTime.year++; break;
+    case 1: nowTime.month++; if (nowTime.month > 12) nowTime.month = 1; break;
+    case 2: {
+      int dim = daysInMonth(nowTime.year, nowTime.month);
+      nowTime.day++; if (nowTime.day > dim) nowTime.day = 1;
+    } break;
+    case 3: nowTime.hour++;   if (nowTime.hour > 23)   nowTime.hour = 0; break;
+    case 4: nowTime.minute++; if (nowTime.minute > 59) nowTime.minute = 0; break;
+    case 5: nowTime.second++; if (nowTime.second > 59) nowTime.second = 0; break;
+  }
+  clampDate(nowTime);
+}
+
+// ======================= Touch utilities =========================
+// Return true when current reading is below threshold (i.e., touched).
+bool touched(uint8_t gpio, uint16_t thr) {
+  uint16_t v = touchRead(gpio);    // On ESP32-S3 we pass the GPIO number
+  return (v < thr);
+}
+
+// Average several readings at idle to get a stable baseline
+uint16_t calibrateTouch(uint8_t gpio) {
+  uint32_t sum = 0;
+  const int N = 16;
+  for (int i = 0; i < N; ++i) {
+    sum += touchRead(gpio);
+    delay(10);
+  }
+  return (uint16_t)(sum / N);
+}
+
+// ======================= Drawing helpers =========================
+void drawUnderline(int16_t x, int16_t y, int16_t w) {
+  display.drawLine(x, y, x + w, y, SSD1306_WHITE);
+}
+
+// Render the entire screen:
+//  - blinkColon: when true, we temporarily hide ':' characters
+//  - underlineActive: underline the currently selected field
+void renderClock(bool blinkColon, bool underlineActive) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+
+  // Line 1: YYYY-MM-DD
+  char line1[20];
+  snprintf(line1, sizeof(line1), "%04d-%02d-%02d",
+           nowTime.year, nowTime.month, nowTime.day);
+  display.println(line1);
+
+  // Line 2: HH:MM:SS  (replace ':' with space when blinking)
+  char cc = blinkColon ? ' ' : ':';
+  char line2[20];
+  snprintf(line2, sizeof(line2), "%02d%c%02d%c%02d",
+           nowTime.hour, cc, nowTime.minute, cc, nowTime.second);
+  display.setCursor(0, 32);
+  display.println(line2);
+
+  // Underline the active field in Set Mode for visual feedback
+  if (underlineActive) {
+    // Approximate character cell width/height at text size 2
+    const int charW = 12;
+    const int baseY1 = 16;  // underline Y for first row
+    const int baseY2 = 48;  // underline Y for second row
+    int16_t x = 0, w = 0, uy = 0;
+
+    // Index map:
+    // Row1: YYYY(0..3) - MM(5..6) - DD(8..9)
+    // Row2: HH(0..1) : MM(3..4) : SS(6..7)
+    switch (selIndex) {
+      case 0: x = 0 * charW; w = 4 * charW; uy = baseY1; break; // Year
+      case 1: x = 5 * charW; w = 2 * charW; uy = baseY1; break; // Month
+      case 2: x = 8 * charW; w = 2 * charW; uy = baseY1; break; // Day
+      case 3: x = 0 * charW; w = 2 * charW; uy = baseY2; break; // Hour
+      case 4: x = 3 * charW; w = 2 * charW; uy = baseY2; break; // Minute
+      case 5: x = 6 * charW; w = 2 * charW; uy = baseY2; break; // Second
+    }
+    drawUnderline(x, uy, w - 2);
+  }
+
+  // Bottom hint line
+  display.setTextSize(1);
+  display.setCursor(0, 56);
+  if (timeSetMode) display.print("SET: T1=exit  T2=next  T3=+1");
+  else              display.print("T1=set  T2=sel   T3=+1");
+
+  display.display();
+}
+
+// ======================= Arduino setup/loop =======================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // Initialize I2C on default SDA/SCL of the board (connect to SDA/SCL pads).
+  Wire.begin();
+
+  // Initialize OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("SSD1306 init failed (check wiring/address).");
+    while (true) { delay(10); }
+  }
+  display.clearDisplay();
+  display.display();
+
+  // -------- Touch calibration (do NOT touch pads while this runs) --------
+  baseToggle = calibrateTouch(TOUCH_TOGGLE);
+  baseSelect = calibrateTouch(TOUCH_SELECT);
+  baseInc    = calibrateTouch(TOUCH_INC);
+
+  // Thresholds: baseline minus a fixed offset
+  thrToggle = (baseToggle > TOUCH_OFFSET) ? (baseToggle - TOUCH_OFFSET) : (uint16_t)(baseToggle * 0.7);
+  thrSelect = (baseSelect > TOUCH_OFFSET) ? (baseSelect - TOUCH_OFFSET) : (uint16_t)(baseSelect * 0.7);
+  thrInc    = (baseInc    > TOUCH_OFFSET) ? (baseInc    - TOUCH_OFFSET) : (uint16_t)(baseInc    * 0.7);
+
+  // First render
+  renderClock(false, false);
+  lastTickMs = millis();
+}
+
+void loop() {
+  const uint32_t nowMs = millis();
+
+  // ------------------- Soft ticking once per second -------------------
+  if (!timeSetMode && nowMs - lastTickMs >= 1000) {
+    lastTickMs += 1000;
+    nowTime.second++;
+    if (nowTime.second >= 60) { nowTime.second = 0; nowTime.minute++; }
+    if (nowTime.minute >= 60) { nowTime.minute = 0; nowTime.hour++; }
+    if (nowTime.hour   >= 24) { nowTime.hour   = 0; nowTime.day++; }
+    int dim = daysInMonth(nowTime.year, nowTime.month);
+    if (nowTime.day > dim) { nowTime.day = 1; nowTime.month++; }
+    if (nowTime.month > 12) { nowTime.month = 1; nowTime.year++; }
+  }
+
+  // ------------------- Touch handling (NO debouncing) -----------------
+  // Touch1: toggle Time-Set Mode immediately when pad is sensed
+  if (touched(TOUCH_TOGGLE, thrToggle)) {
+    timeSetMode = !timeSetMode;
+    if (!timeSetMode) {
+      // Leaving Set Mode: normalize date and re-align the 1-second tick
+      clampDate(nowTime);
+      lastTickMs = nowMs;
+    }
+    // Because there is no debouncing, holding the finger will flip many times.
+    // Tap quickly to avoid toggling back and forth.
+  }
+
+  // Touch2: move selection (only meaningful while in Set Mode)
+  if (timeSetMode && touched(TOUCH_SELECT, thrSelect)) {
+    selIndex = (selIndex + 1) % 6;
+  }
+
+  // Touch3: increment active field (only in Set Mode)
+  if (timeSetMode && touched(TOUCH_INC, thrInc)) {
+    incrementField(selIndex);
+  }
+
+  // ------------------- Rendering (limit refresh rate) -----------------
+  static uint32_t lastDrawMs = 0;
+  const bool blinkColon = timeSetMode ? ((nowMs / 500) % 2 == 0) : false;
+  const uint32_t refreshMs = timeSetMode ? 100 : 250;
+
+  if (nowMs - lastDrawMs >= refreshMs) {
+    lastDrawMs = nowMs;
+    renderClock(blinkColon, timeSetMode);
+  }
+}
