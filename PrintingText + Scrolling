@@ -1,0 +1,58 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// OLED display dimensions
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+// Create display object with I2C interface
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+void setup() {
+  // Initialize I2C display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // most 128x64 OLEDs use address 0x3C
+    for (;;); // stop if not found
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);      // 1 = small, 2 = medium, 3 = large
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("OLED Ready!");
+  display.display();
+  delay(1000);
+}
+
+void loop() {
+  display.clearDisplay();
+
+  // Print numbers 0–9 on first "line"
+  display.setCursor(0, 0);
+  for (int thisChar = 0; thisChar < 10; thisChar++) {
+    display.print(thisChar);
+    display.display();
+    delay(500);
+  }
+
+  // Now simulate autoscroll by moving text to the left
+  for (int scroll = 0; scroll < 64; scroll++) {
+    display.startscrollleft(0x00, 0x0F); // scroll entire screen
+    delay(50);
+  }
+  display.stopscroll();
+
+  // Print 0–9 again on bottom area
+  display.clearDisplay();
+  display.setCursor(0, 32);
+  for (int thisChar = 0; thisChar < 10; thisChar++) {
+    display.print(thisChar);
+    display.display();
+    delay(500);
+  }
+
+  // Wait and clear
+  delay(1000);
+  display.clearDisplay();
+  display.display();
+}
