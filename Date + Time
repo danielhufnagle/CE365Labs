@@ -1,0 +1,83 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ==== Display setup ====
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ==== Clock variables ====
+unsigned long prevMillis = 0;
+int seconds = 0;
+int minutes = 0;
+int hours = 0;
+
+// ==== Date string ====
+String dateStr = "01/01/01";
+int scrollX = SCREEN_WIDTH;
+
+void setup() {
+  Serial.begin(115200);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    for (;;);
+  }
+
+  display.clearDisplay();
+  display.display();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Update time every second
+  if (currentMillis - prevMillis >= 1000) {
+    prevMillis = currentMillis;
+
+    seconds++;
+    if (seconds >= 60) {
+      seconds = 0;
+      minutes++;
+      if (minutes >= 60) {
+        minutes = 0;
+        hours++;
+        if (hours >= 24) hours = 0;
+      }
+    }
+  }
+
+  // Format time string (HH:MM:SS)
+  char timeBuffer[9];
+  sprintf(timeBuffer, "%02d:%02d:%02d", hours, minutes, seconds);
+
+  // Calculate text width for scrolling date
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.setTextSize(2);
+  display.getTextBounds(dateStr, 0, 0, &x1, &y1, &w, &h);
+
+  // Scroll logic for date
+  if (scrollX < -w) scrollX = SCREEN_WIDTH;
+
+  // ==== Draw everything ====
+  display.clearDisplay();
+
+  // Draw large time
+  display.setTextSize(2); // large time font
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(8, 8);
+  display.print(timeBuffer);
+
+  // Draw scrolling date
+  display.setTextSize(2);
+  display.setCursor(scrollX, 48);
+  display.print(dateStr);
+
+  display.display();
+
+  // Scroll date left
+  scrollX -= 2; // adjust scroll speed
+  delay(100);
+}
