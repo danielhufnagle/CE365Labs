@@ -1,0 +1,109 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <MPU9250_WE.h> // Works fine for MPU-6500 too
+
+// ======================
+//  Hardware definitions
+// ======================
+#define MPU9250_ADDR 0x68
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+MPU9250_WE myMPU9250 = MPU9250_WE(MPU9250_ADDR);
+
+// ======================
+//  Scroll state
+// ======================
+int scrollX = 0;
+int scrollY = 0;
+const int scrollSpeed = 3; // pixels per frame
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(); // SDA/SCL shared by OLED + MPU6500
+
+  // ---- Initialize OLED ----
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED not found!");
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // ---- Initialize MPU ----
+  if(!myMPU9250.init()){
+    Serial.println("MPU9250 does not respond");
+  }
+  else{
+    Serial.println("MPU9250 is connected");
+  }
+  if(!myMPU9250.initMagnetometer()){
+    Serial.println("Magnetometer does not respond");
+  }
+  else{
+    Serial.println("Magnetometer is connected");
+  }
+
+  Serial.println("Position you MPU9250 flat and don't move it - calibrating...");
+  delay(1000);
+  myMPU9250.autoOffsets();
+  Serial.println("Done!");
+  myMPU9250.enableGyrDLPF();
+  myMPU9250.setGyrDLPF(MPU9250_DLPF_6);
+  myMPU9250.setSampleRateDivider(5);
+  myMPU9250.setGyrRange(MPU9250_GYRO_RANGE_250);
+  myMPU9250.setAccRange(MPU9250_ACC_RANGE_2G);
+  myMPU9250.enableAccDLPF(true);
+  myMPU9250.setAccDLPF(MPU9250_DLPF_6);
+  myMPU9250.setMagOpMode(AK8963_CONT_MODE_100HZ);
+  delay(200);
+}
+
+void loop() {
+  // ---- Read sensor values ----
+  xyzFloat gValue = myMPU9250.getGValues();
+  xyzFloat gyr = myMPU9250.getGyrValues();
+  xyzFloat magValue = myMPU9250.getMagValues();
+  float temp = myMPU9250.getTemperature();
+  float resultantG = myMPU9250.getResultantG(gValue);
+
+  // ---- Determine scroll direction from tilt ----
+  // Tilt thresholds: adjust as needed for your sensitivity
+  if (gValue.x < -0.4)      scrollY += scrollSpeed; // Tilt forward → scroll down
+  else if (gValue.x > 0.4) scrollY -= scrollSpeed; // Tilt back → scroll up
+
+  if (gValue.y > 0.4)      scrollX -= scrollSpeed; // Tilt right → scroll right
+  else if (gValue.y < -0.4) scrollX += scrollSpeed; // Tilt left → scroll left
+
+  // ---- Keep scrolling bounds sane ----
+  if (scrollX > SCREEN_WIDTH) scrollX = -SCREEN_WIDTH;
+  if (scrollX < -SCREEN_WIDTH) scrollX = SCREEN_WIDTH;
+  if (scrollY > SCREEN_HEIGHT) scrollY = -SCREEN_HEIGHT / 2;
+  if (scrollY < -SCREEN_HEIGHT / 2) scrollY = SCREEN_HEIGHT / 2;
+
+  // ---- Prepare display text ----
+  char accelText[40];
+  char gyroText[40];
+  snprintf(accelText, sizeof(accelText), "ACC X:%+.2f Y:%+.2f Z:%+.2f", gValue.x, gValue.y, gValue.z);
+  snprintf(gyroText, sizeof(gyroText), "GYR X:%+.1f Y:%+.1f Z:%+.1f", gyr.x, gyr.y, gyr.z);
+
+  // ---- Draw everything ----
+  display.clearDisplay();
+  display.setTextSize(1);
+
+  display.setCursor(4 + scrollX / 4, 10 + scrollY / 4); // small parallax movement
+  // display.println("MPU-6500 Live Data");
+
+  display.setTextSize(1);
+  display.setCursor(scrollX, 20 + scrollY);
+  display.print(accelText);
+
+  display.setCursor(scrollX, 40 + scrollY);
+  display.print(gyroText);
+
+  display.display();
+  delay(50);
+}
+
