@@ -1,1 +1,319 @@
 
+/*
+  XIAO ESP32S3 ↔ MPU-6500 Readout Benchmark (SPI vs I2C)
+  ------------------------------------------------------
+  Goal:
+    - Read accelerometer + gyroscope in a 14-byte burst (ACC/Temp/GYRO).
+    - Sweep through a set of target sampling intervals (slow → fast).
+    - For each interval, measure:
+        * Achieved loop rate (Hz)
+        * Repeated-frame ratio (exactly same vector as previous frame)
+        * Invalid-frame ratio (all zeros or all 0x7FFF/0x8000 patterns)
+    - Determine the "maximum effective readout rate": last interval where
+      repeat% <= REPEAT_RATIO_MAX and invalid% <= INVALID_RATIO_MAX.
+
+  How to use:
+    1) Wire SPI first. Upload as-is (USE_SPI=true). Open Serial Monitor.
+    2) Rewire for I2C, change USE_SPI to false, upload again, compare SUMMARY.
+  Notes:
+    - This is a transport-capacity comparison via polling (no FIFO/interrupt).
+    - Static scenes can produce some identical frames; the ratio should still be low.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+
+// ---- Select bus: true = SPI, false = I2C ----
+#define USE_SPI  true
+
+// ---- XIAO ESP32S3 SPI pins (adjust to your wiring) ----
+const int PIN_SCK  = 7;   // silk: SCK  -> GPIO7
+const int PIN_MISO = 8;   // silk: MISO -> GPIO8
+const int PIN_MOSI = 9;   // silk: MOSI -> GPIO9
+const int PIN_CS   = 10;  // your chosen CS pin (default GPIO10)
+
+// ---- I2C address (AD0=0 => 0x68; AD0=1 => 0x69) ----
+uint8_t MPU_ADDR = 0x68;
+
+// ---- MPU-6500 registers ----
+#define REG_SMPLRT_DIV   0x19
+#define REG_CONFIG       0x1A
+#define REG_GYRO_CONFIG  0x1B
+#define REG_ACCEL_CONFIG 0x1C
+#define REG_INT_PIN_CFG  0x37
+#define REG_INT_STATUS   0x3A
+#define REG_ACCEL_XOUT_H 0x3B
+#define REG_PWR_MGMT_1   0x6B
+#define REG_WHO_AM_I     0x75
+
+// ---- SPI setup (MPU-6500 uses MSB=1 for reads) ----
+SPIClass spi(VSPI);
+
+// ---- Benchmark parameters ----
+// Target intervals in microseconds (slow → fast)
+const uint32_t TARGET_US_LIST[] = {
+  1000000, 500000, 200000, 100000, 50000, 20000, 10000,
+  5000, 2000, 1000, 800, 600, 500, 400, 300, 200, 150, 120, 100
+};
+const size_t   TARGET_CNT = sizeof(TARGET_US_LIST) / sizeof(TARGET_US_LIST[0]);
+
+const int      SAMPLES_PER_STEP = 800;   // frames per test step
+const float    REPEAT_RATIO_MAX  = 0.20; // max allowed same-as-previous ratio
+const float    INVALID_RATIO_MAX = 0.02; // max allowed invalid-frame ratio
+
+// ---- Busy-wait until target interval elapses; advance anchor ----
+inline void waitUntil(uint32_t &t0, uint32_t target_us) {
+  while ((uint32_t)(micros() - t0) < target_us) { /* spin */ }
+  t0 += target_us;
+}
+
+// ========================== I2C helpers ==========================
+void i2cWrite1(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission(true);
+}
+
+void i2cReadN(uint8_t reg, uint8_t *buf, size_t n) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((int)MPU_ADDR, (int)n, (int)true);
+  for (size_t i = 0; i < n && Wire.available(); ++i) buf[i] = Wire.read();
+}
+
+// ========================== SPI helpers ==========================
+void spiWrite1(uint8_t reg, uint8_t val) {
+  digitalWrite(PIN_CS, LOW);
+  spi.transfer(reg & 0x7F); // write: MSB=0
+  spi.transfer(val);
+  digitalWrite(PIN_CS, HIGH);
+}
+
+void spiReadN(uint8_t reg, uint8_t *buf, size_t n) {
+  digitalWrite(PIN_CS, LOW);
+  spi.transfer(reg | 0x80); // read: MSB=1
+  for (size_t i = 0; i < n; ++i) buf[i] = spi.transfer(0x00);
+  digitalWrite(PIN_CS, HIGH);
+}
+
+// ===================== Unified bus wrappers ======================
+void mpuWrite1(uint8_t reg, uint8_t val) {
+  if (USE_SPI) spiWrite1(reg, val);
+  else         i2cWrite1(reg, val);
+}
+
+void mpuReadN(uint8_t reg, uint8_t *buf, size_t n) {
+  if (USE_SPI) spiReadN(reg, buf, n);
+  else         i2cReadN(reg, buf, n);
+}
+
+// ====================== MPU-6500 initialization ==================
+bool mpuInit() {
+  // 1) Wake up and select PLL as clock source for stability
+  mpuWrite1(REG_PWR_MGMT_1, 0x01);  // CLKSEL=1 (PLL), SLEEP=0
+  delay(10);
+
+  // 2) Set DLPF and sample rate:
+  //    CONFIG.DLPF_CFG=3 (~44/42 Hz BW, internal 1 kHz), SMPLRT_DIV=0 (1 kHz ODR)
+  mpuWrite1(REG_CONFIG, 0x03);
+  mpuWrite1(REG_SMPLRT_DIV, 0x00);
+
+  // 3) Ranges: gyro ±250 dps, accel ±2g
+  mpuWrite1(REG_GYRO_CONFIG,  0x00);
+  mpuWrite1(REG_ACCEL_CONFIG, 0x00);
+
+  // 4) WHO_AM_I sanity check (MPU-6500 expected 0x70)
+  uint8_t id = 0;
+  mpuReadN(REG_WHO_AM_I, &id, 1);
+  if (id != 0x70) {
+    Serial.print("[WARN] WHO_AM_I=0x"); Serial.print(id, HEX);
+    Serial.println(" (expected 0x70). Continuing anyway.");
+  } else {
+    Serial.println("[OK] WHO_AM_I=0x70");
+  }
+  return true;
+}
+
+// ========================= Data structures =======================
+struct RawFrame {
+  int16_t ax, ay, az;
+  int16_t temp;
+  int16_t gx, gy, gz;
+};
+
+// Read the 14-byte burst starting at ACCEL_XOUT_H
+void readBurst(RawFrame &f) {
+  uint8_t buf[14];
+  mpuReadN(REG_ACCEL_XOUT_H, buf, 14);
+  f.ax   = (int16_t)((buf[0]  << 8) | buf[1]);
+  f.ay   = (int16_t)((buf[2]  << 8) | buf[3]);
+  f.az   = (int16_t)((buf[4]  << 8) | buf[5]);
+  f.temp = (int16_t)((buf[6]  << 8) | buf[7]);
+  f.gx   = (int16_t)((buf[8]  << 8) | buf[9]);
+  f.gy   = (int16_t)((buf[10] << 8) | buf[11]);
+  f.gz   = (int16_t)((buf[12] << 8) | buf[13]);
+}
+
+// Heuristic invalid-frame detection (common failure patterns)
+bool isInvalid(const RawFrame &f) {
+  bool allZero =
+    (f.ax | f.ay | f.az | f.gx | f.gy | f.gz | f.temp) == 0;
+  bool all7FFF =
+    (f.ax==0x7FFF && f.ay==0x7FFF && f.az==0x7FFF &&
+     f.gx==0x7FFF && f.gy==0x7FFF && f.gz==0x7FFF);
+  bool all8000 =
+    (f.ax==0x8000 && f.ay==0x8000 && f.az==0x8000 &&
+     f.gx==0x8000 && f.gy==0x8000 && f.gz==0x8000);
+  return allZero || all7FFF || all8000;
+}
+
+// Exact equality on accel and gyro vectors
+bool isSame(const RawFrame &a, const RawFrame &b) {
+  return (a.ax==b.ax && a.ay==b.ay && a.az==b.az &&
+          a.gx==b.gx && a.gy==b.gy && a.gz==b.gz);
+}
+
+// ==================== One step of the benchmark ==================
+void runStep(uint32_t target_us) {
+  RawFrame prev{}, cur{};
+  int repeats = 0;
+  int invalids = 0;
+
+  // Prime the previous frame
+  readBurst(prev);
+
+  uint32_t t0 = micros();
+  uint32_t tStart = t0;
+
+  for (int i = 0; i < SAMPLES_PER_STEP; i++) {
+    waitUntil(t0, target_us);   // precise timing anchor
+    readBurst(cur);
+
+    if (isInvalid(cur)) invalids++;
+    if (isSame(cur, prev)) repeats++;
+
+    prev = cur;
+  }
+
+  uint32_t elapsed_us = micros() - tStart;
+  float hz_actual  = 1e6f * SAMPLES_PER_STEP / (float)elapsed_us;
+  float repeatRate = repeats  / (float)SAMPLES_PER_STEP;
+  float invalidRate= invalids / (float)SAMPLES_PER_STEP;
+
+  Serial.println("----------------------------------------------------");
+  Serial.print("MODE     : "); Serial.println(USE_SPI ? "SPI" : "I2C");
+  Serial.print("TARGET   : every "); Serial.print(target_us); Serial.println(" us");
+  Serial.print("ACTUAL   : "); Serial.print(hz_actual, 2); Serial.println(" Hz");
+  Serial.print("REPEATS  : "); Serial.print(repeats); Serial.print(" / ");
+  Serial.print(SAMPLES_PER_STEP); Serial.print(" (");
+  Serial.print(repeatRate * 100.0f, 2); Serial.println(" %)");
+  Serial.print("INVALIDS : "); Serial.print(invalids); Serial.print(" / ");
+  Serial.print(SAMPLES_PER_STEP); Serial.print(" (");
+  Serial.print(invalidRate * 100.0f, 2); Serial.println(" %)");
+
+  bool ok = (repeatRate <= REPEAT_RATIO_MAX) && (invalidRate <= INVALID_RATIO_MAX);
+  Serial.print("EFFECTIVE: ");
+  Serial.println(ok ? "OK (sustainable)" : "NOT OK (too many repeats/invalids)");
+}
+
+// ===================== Full sweep + summary ======================
+void runAll() {
+  Serial.println();
+  Serial.println("========== BEGIN BENCH ==========");
+  int best_us = -1;
+
+  for (size_t i = 0; i < TARGET_CNT; i++) {
+    uint32_t us = TARGET_US_LIST[i];
+
+    // Inline step (duplicated to keep timing tight)
+    RawFrame prev{}, cur{};
+    int repeats = 0, invalids = 0;
+
+    readBurst(prev);
+    uint32_t t0 = micros();
+    uint32_t tStart = t0;
+
+    for (int k = 0; k < SAMPLES_PER_STEP; k++) {
+      waitUntil(t0, us);
+      readBurst(cur);
+      if (isInvalid(cur)) invalids++;
+      if (isSame(cur, prev)) repeats++;
+      prev = cur;
+    }
+
+    uint32_t elapsed_us = micros() - tStart;
+    float hz_actual  = 1e6f * SAMPLES_PER_STEP / (float)elapsed_us;
+    float repeatRate = repeats   / (float)SAMPLES_PER_STEP;
+    float invalidRate= invalids  / (float)SAMPLES_PER_STEP;
+    bool ok = (repeatRate <= REPEAT_RATIO_MAX) && (invalidRate <= INVALID_RATIO_MAX);
+
+    Serial.println("----------------------------------------------------");
+    Serial.print("TARGET(us): ");  Serial.print(us);
+    Serial.print(" | ACTUAL(Hz): "); Serial.print(hz_actual, 2);
+    Serial.print(" | repeat%: ");    Serial.print(repeatRate * 100.0f, 2);
+    Serial.print(" | invalid%: ");   Serial.print(invalidRate * 100.0f, 2);
+    Serial.print(" | OK? ");         Serial.println(ok ? "YES" : "NO");
+
+    if (ok) best_us = us; // record latest OK — fastest sustainable interval
+  }
+
+  Serial.println("========== SUMMARY ==========");
+  Serial.print("BUS      : "); Serial.println(USE_SPI ? "SPI" : "I2C");
+  if (best_us < 0) {
+    Serial.println("Max effective rate: NONE within tested range.");
+  } else {
+    float bestHz = 1e6f / (float)best_us;
+    Serial.print("Max effective rate (approx): ");
+    Serial.print(bestHz, 2); Serial.println(" Hz");
+    Serial.print("(@ target interval ~ "); Serial.print(best_us); Serial.println(" us)");
+  }
+  Serial.println("===============================");
+}
+
+// ============================ Arduino ============================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println();
+  Serial.println(USE_SPI ? "[SPI MODE]" : "[I2C MODE]");
+
+  if (USE_SPI) {
+    // SPI init: chip-select + bus
+    pinMode(PIN_CS, OUTPUT);
+    digitalWrite(PIN_CS, HIGH);
+    spi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+    // MPU-6500 supports up to ~20 MHz; start at 10 MHz, MODE0
+    spi.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  } else {
+    // I2C init: default SDA/SCL pads on XIAO; try 400 kHz (you can try 1 MHz)
+    Wire.begin();
+    Wire.setClock(400000);
+    MPU_ADDR = 0x68; // set to 0x69 if AD0 pulled high
+  }
+
+  if (!mpuInit()) {
+    Serial.println("[FATAL] MPU init failed.");
+    while (1) delay(10);
+  }
+
+  // Warm-up read
+  RawFrame f{}; readBurst(f);
+  Serial.print("Warmup AX,AY,AZ = ");
+  Serial.print(f.ax); Serial.print(", ");
+  Serial.print(f.ay); Serial.print(", ");
+  Serial.println(f.az);
+
+  delay(200);
+  runAll();
+
+  if (USE_SPI) {
+    spi.endTransaction();
+  }
+}
+
+void loop() {
+  // One-shot run in setup(). Call runAll() here if you want continuous testing.
+}
