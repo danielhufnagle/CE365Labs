@@ -39,7 +39,7 @@
  */
 
 /* Includes ---------------------------------------------------------------- */
-#include <XIAO-ESP32S3-KWS_inferencing.h>
+#include <FinalProject_365_inferencing.h>
 
 #include <I2S.h>
 #define SAMPLE_RATE 16000U
