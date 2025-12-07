@@ -187,7 +187,7 @@ void loop()
       }
     }
         // Display inference result
-        if (pred_index == 3){
+        if (strcmp(result.classification[pred_index].label, "Jarvis") == 0){
             digitalWrite(LED_BUILT_IN, LOW); //Turn on
             // trigger speech-to-GPT once per LED on transition
             if(!speechTriggered){
